@@ -231,9 +231,9 @@ def other_process(file):
 def main():
   gz = glob.glob(os.path.join(INPUT_DIR, '*.json'))
   if not gz:
-    print("No gzipped files found")
+    print("No files found")
     return 
-  print(f"found {len(gz)} gzipped files")
+  print(f"found {len(gz)} files")
   for file in gz:
     print(f"processing {file}")
     other_process(file)
