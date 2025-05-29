@@ -1,37 +1,29 @@
-from concurrent.futures import TimeoutError
-from google.cloud import pubsub_v1
 import json
 from datetime import datetime
-from google.oauth2 import service_account
 import pandas as pd
 import psycopg2
 import os
 import io
 import csv
+import shutil
+import glob
+from dotenv import load_dotenv 
+load_dotenv()
 
-#config
-project_id = "mov-data-eng"
-subscription_id = "stop-events-sub"  ##change
-SERVICE_ACCOUNT_FILE = "/opt/shared/service-account.json"
-
-#pub/sub setup
-pubsub_creds2 = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
-subscriber = pubsub_v1.SubscriberClient(credentials=pubsub_creds2)
-subscription_path = subscriber.subscription_path(project_id, subscription_id)
 
 #directory
-OUTPUT_DIR = '/opt/shared/output'
+INPUT_DIR = '/opt/shared/mov-data-pipeline-stop/bus_data/2025-05-28'
+OUTPUT_DIR = '/opt/shared/mov-data-pipeline-stop/output2/2025-05-28'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 def db_connect():
     return psycopg2.connect(
-            dbname="postgres",
-            user="postgres",
-            password="movv",
-            host="localhost"
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            host=os.getenv("DB_HOST")
     )
 
 
-json_data = []
 TableName = 'trip'
 
 
@@ -90,7 +82,7 @@ def validate_service_key(df):
     keys = ['W', 'S', 'U']
     
     df['service_key'] = df['service_key'].apply(lambda x: x if x in keys else 'W')
-    # assert df['service_key'].apply(lambda x: pd.isna(x) or x in keys).all(), "service_key must be either null, W, U, or S"
+    
     maps = {'W': 'Weekday', 'S': 'Saturday', 'U': 'Sunday'}
     df['service_key'] = df['service_key'].replace(maps)
     assert df['service_key'].isin(['Weekday', 'Saturday', 'Sunday']).all(), "service_key must be either Weekday, Saturday, or Sunday"
@@ -100,29 +92,70 @@ def validate_service_key(df):
     return None
 
   
+def validate_trip_id(df):
+  try:
+    var = pd.to_numeric(df['trip_id'], errors='coerce')
+    assert var.notna().all(), "trip_id contains null values"
+    df['trip_id'] = var
+    return df
+  except Exception as e:
+    print(f"Error validating column trip id: {e}")
+    return None
+
+def validate_ons(df):
+  try:
+    var = pd.to_numeric(df['ons'], errors='coerce')
+    assert var.notna().all(), "ons contains null values"
+    df['ons'] = var
+    return df
+  except Exception as e:
+    print(f"Error validating column ons: {e}")
+    return None
+
+def validate_offs(df):
+  try:
+    var = pd.to_numeric(df['offs'], errors='coerce')
+    assert var.notna().all(), "offs contains null values"
+    df['offs'] = var
+    return df
+  except Exception as e:
+    print(f"Error validating column offs: {e}")
+    return None
+def validate_train(df):
+  try:
+    var = pd.to_numeric(df['train'], errors='coerce')
+    assert var.notna().all(), "train contains null values"
+    df['train'] = var
+    return df    
+  except Exception as e:
+    print(f"Error validating column train: {e}")
+    return None
+
+def validate_max_speed(df):
+  try:
+    var = pd.to_numeric(df['maximum_speed'], errors='coerce')
+    assert var.notna().all(), "maximum_speed contains null values"
+    df['maximum_speed'] = var
+    return df
+  except Exception as e:
+    print(f"Error validating column maximum_speed: {e}")
+    return None
+
 def validate_data(df):
   df = validate_vehicle_no(df)
   df = validate_route_number(df)
   df = validate_trip_number(df)
   df = validate_direction(df)
   df = validate_service_key(df)
+  df = validate_trip_id(df)
+  df = validate_ons(df)
+  df = validate_offs(df)
+  df = validate_train(df)
+  df = validate_max_speed(df)
   return df
 
-#function to get existing trip ids from the trip table
-def get_existing_trip_ids():
-  conn = None
-  try:
-      conn = db_connect()
-      with conn.cursor() as cursor:
-          cursor.execute(f"SELECT trip_id FROM {TableName}")
-          existing_trip_ids = [row[0] for row in cursor.fetchall()]
-          return existing_trip_ids
-  except Exception as e:
-      print(f"Error getting existing trip ids: {e}")
-      return []
-  finally:
-      if conn:
-          conn.close()
+
+
 
 #store both trip and everthing in the database
 def store_database(df):
@@ -135,12 +168,12 @@ def store_database(df):
       if col not in df_new.columns:
         print(f"Column {col} not found in DataFrame")
         return False
-    #check for existing trip ids
-    trip_ids = df_new['trip_id'].unique().tolist()
-    print(f"trip ids: {len(trip_ids)} unique")
 
     df_new = df_new.rename(columns={'trip_id':'trip_id', 'route_number':'route_id', 'vehicle_number':'vehicle_id', 'service_key':'service_key', 'direction':'direction'})
     dataframe_data =  df_new[['trip_id', 'route_id', 'vehicle_id', 'service_key', 'direction']]
+    #delete duplicate trip id rows
+    dataframe_data = dataframe_data.drop_duplicates(subset=['trip_id'])
+    
 
     f = io.StringIO()
     dataframe_data.to_csv(f, header=False, index=False, sep ='\t')
@@ -160,73 +193,51 @@ def store_database(df):
       if conn:
         conn.close()
 
-def callback(message):
+
+def other_process(file):
   try:
-     data = json.loads(message.data.decode('utf-8'))
-     json_data.append(data)
-     message.ack() 
-  except Exception as e:
-    print(f"Error processing message: {e}")
-    message.nack()
- 
-
-
-def other_process(json_data):
-  if not json_data:
-    print("No data to process")
-    return None
-
-  try:
+    json_data = []
+    with open(file, 'r', encoding='utf-8') as f:
+      json_data = json.load(f)
+      print(f"loaded {len(json_data)} records from {file}")
+      if not json_data:
+        print(f"No data to process")
+        return False
     df = pd.DataFrame(json_data)
+    #remove duplicate trip id
+    df = df.drop_duplicates(subset=['trip_id'])
+    #validate data
     df = validate_data(df)
     print("data validation complete")
 
     if df is not None and not df.empty:
       save_db = store_database(df)
       if save_db:
-        json_data = df.to_dict(orient='records')
-        timestamp = datetime.now()
-        filename = os.path.join(OUTPUT_DIR, timestamp.strftime('%Y-%m-%d') + '.json')
-        try:
-          with open(filename, 'a') as f:
-            for data in json_data:
-              json.dump(data, f)
-              f.write('\n')
-          print(f"Saved {len(json_data)} records to {filename}")
-        except Exception as e:
-          print(f"Error saving data to file: {e}")
-        json_data.clear()
-        return df
+        path = os.path.join(OUTPUT_DIR, os.path.basename(file))
+        shutil.copy(file, path)
+        print(f"copied {file} to {path}")
+        return True
       else:
         print("Error storing data in database")
+        return False
     else:
       print("No valid data to process")
-    json_data.clear()
-    return None
+      return False
   except Exception as e:
     print(f"Error processing data: {e}")
-    json_data.clear()
-    return None
+    return False
 
 
-print(f"Listening for messages on {subscription_path}..\n")
-while True:
-  try:
-    streaming_pull_future = subscriber.subscribe(subscription_path, callback=callback)
-    try:
-        streaming_pull_future.result(timeout = 20)
-    except TimeoutError:
-        streaming_pull_future.cancel()
-        streaming_pull_future.result()
-        print("Timeout occurred, exiting.")
-    pro_df = other_process(json_data)
-    if pro_df is not None:
-      print(f"successfully processed  {len(pro_df)} records")
-    else:
-      print("no data to process")
-  except KeyboardInterrupt:
-    print('interrupted by keyboard')
-    break
-  except Exception as e:
-    print(f"Error processing loop: {e}")
-    continue
+def main():
+  gz = glob.glob(os.path.join(INPUT_DIR, '*.json'))
+  if not gz:
+    print("No gzipped files found")
+    return 
+  print(f"found {len(gz)} gzipped files")
+  for file in gz:
+    print(f"processing {file}")
+    other_process(file)
+  print("done")
+
+if __name__ == '__main__':
+  main()

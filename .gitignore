@@ -7,3 +7,5 @@ oroenv
 *.json
 output/*
 *.swp
+output2
+*.swo
